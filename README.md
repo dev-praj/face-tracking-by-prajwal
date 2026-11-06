@@ -62,3 +62,7 @@ Servo motion depends on the servo's power supply and mechanical range. The
 tracker limits commanded angles to reduce the chance of driving the servo into
 its mechanical stops; adjust the angle limits in `tracker.py` only to match
 your hardware.
+
+## Credits
+
+Parts of this project are based on Face-Tracking-Using-Arduino-and-Open-CV by Hrithik Anchaliya (https://github.com/HrithikAnchaliya/Face-Tracking-Using-Arduino-and-Open-CV-).
