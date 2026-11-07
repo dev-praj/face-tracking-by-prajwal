@@ -11,8 +11,9 @@ not compatible with the current tracker.
 
 ## How tracking works
 
-1. OpenCV reads frames from the selected webcam and detects faces with its
-   bundled Haar cascade.
+1. OpenCV reads frames from the selected webcam and checks frontal and
+   profile-face cascades, including a mirrored profile pass for either
+   direction of head turn.
 2. The largest detected face is treated as the subject.
 3. The tracker compares the face's horizontal center with the frame center.
 4. It converts the horizontal error into a bounded pan angle and sends that
@@ -21,7 +22,17 @@ not compatible with the current tracker.
 
 When the face is near the center, the servo holds its position. The tracker
 shows `TRACKING` or `NO FACE`, the horizontal pixel offset, the commanded angle,
-and the active pan direction in its preview.
+and the active pan direction in its preview. Face-position filtering helps
+reduce jitter. The pan response adds a limited boost when the face moves away
+from center and slows as it moves back toward center, helping avoid overshoot.
+The servo step remains bounded and the angle is limited to its configured
+range.
+
+If no face is detected for 10 seconds, the tracker scans between the configured
+pan limits with two complete back-and-forth sweeps. It checks every camera frame
+during the scan and resumes tracking as soon as it detects a face. If the scan
+finds no face, it keeps checking the camera while waiting five minutes before
+scanning again.
 
 ## Hardware
 

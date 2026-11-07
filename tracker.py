@@ -1,7 +1,8 @@
+import argparse
+import math
 import os
 import sys
 import time
-import argparse
 
 import cv2
 import serial
@@ -26,13 +27,29 @@ CROP_HEIGHT = 240
 # Run Haar detection every N processed frames; servo still updates every frame.
 DETECT_EVERY_N_FRAMES = 1
 # Proportional pan gain in degrees per pixel of horizontal face error.
-KP = 0.10
+KP = 0.08
 # Horizontal pixel error within which the servo holds its current position.
 DEAD_ZONE_PX = 8
 # Largest commanded angle change per processed frame, in degrees.
-MAX_STEP_DEG = 8.0
-# Exponential-smoothing factor applied to the target angle, from 0 to 1.
-SMOOTHING = 0.9
+MAX_STEP_DEG = 3.0
+# Filter factor for measured face movement; lower values smooth more.
+ERROR_SMOOTHING = 0.65
+# Fraction of each pan correction applied per frame.
+SMOOTHING = 0.65
+# Face motion at or above this many pixels per frame gets the full speed boost.
+VELOCITY_SCALE_PX_PER_FRAME = 6.0
+# Moving-away gain boost is limited to avoid overshooting the face.
+MAX_VELOCITY_BOOST = 0.5
+# Filter factor for face speed; a high value also releases stale speed quickly.
+VELOCITY_SMOOTHING = 0.7
+VELOCITY_DEAD_ZONE_PX_PER_FRAME = 1.5
+# Start searching after this long without a detected face.
+NO_FACE_SCAN_DELAY_SECONDS = 10.0
+# Pause this long after an unsuccessful scan before searching again.
+SCAN_RETRY_DELAY_SECONDS = 5 * 60
+# Servo target speed while searching, in degrees per second.
+SCAN_SPEED_DEG_PER_SECOND = 45.0
+SCAN_CYCLES = 2
 # This mounting direction was confirmed by observing the camera turn away.
 INVERT_DIRECTION = True
 # Minimum allowed pan angle in degrees.
@@ -105,17 +122,51 @@ def open_camera(camera_index):
     return capture
 
 
-def detect_largest_face(gray_frame, face_cascade):
-    """Detect faces on the full frame and return the largest box, or None."""
-    faces = face_cascade.detectMultiScale(
-        gray_frame,
-        scaleFactor=1.15,
-        minNeighbors=4,
-        minSize=(24, 24),
-    )
-    if len(faces) == 0:
+def detect_largest_face(gray_frame, face_cascades):
+    """Detect frontal and profile faces and return the largest box, if any."""
+    candidates = []
+    frame_width = gray_frame.shape[1]
+
+    for cascade, flipped in face_cascades:
+        search_frame = cv2.flip(gray_frame, 1) if flipped else gray_frame
+        faces = cascade.detectMultiScale(
+            search_frame,
+            scaleFactor=1.1,
+            minNeighbors=3,
+            minSize=(20, 20),
+        )
+        for x, y, width, height in faces:
+            if flipped:
+                x = frame_width - x - width
+            candidates.append((int(x), int(y), int(width), int(height)))
+
+    if not candidates:
         return None
-    return max(faces, key=lambda face: int(face[2]) * int(face[3]))
+    return max(candidates, key=lambda face: face[2] * face[3])
+
+
+def load_face_cascades():
+    """Load frontal and mirrored profile cascades provided by OpenCV."""
+    cascade_directory = cv2.data.haarcascades
+    cascade_files = (
+        ("haarcascade_frontalface_default.xml", False),
+        ("haarcascade_frontalface_alt2.xml", False),
+        ("haarcascade_profileface.xml", False),
+        ("haarcascade_profileface.xml", True),
+    )
+    face_cascades = []
+    for filename, flipped in cascade_files:
+        path = os.path.join(cascade_directory, filename)
+        cascade = cv2.CascadeClassifier(path)
+        if not cascade.empty():
+            face_cascades.append((cascade, flipped))
+
+    if not face_cascades:
+        raise RuntimeError(
+            "Could not load any frontal or profile face cascades from "
+            "{0}.".format(cascade_directory)
+        )
+    return face_cascades
 
 
 def crop_origin(center_x, center_y, frame_width, frame_height):
@@ -144,27 +195,71 @@ def send_servo_angle(serial_connection, angle, write_error_printed):
         return True
 
 
-def update_pan_angle(current_angle, error_px, invert_direction=INVERT_DIRECTION):
+def update_pan_angle(
+    current_angle,
+    error_px,
+    invert_direction=INVERT_DIRECTION,
+    face_velocity_px_per_frame=0.0,
+):
     if abs(error_px) <= DEAD_ZONE_PX:
         return current_angle
 
+    velocity = face_velocity_px_per_frame
+    if abs(velocity) < VELOCITY_DEAD_ZONE_PX_PER_FRAME:
+        velocity = 0.0
+    velocity_ratio = min(abs(velocity) / VELOCITY_SCALE_PX_PER_FRAME, 1.0)
+    if error_px * velocity > 0:
+        response_scale = 1.0 + MAX_VELOCITY_BOOST * velocity_ratio
+    elif error_px * velocity < 0:
+        response_scale = 1.0 - 0.5 * velocity_ratio
+    else:
+        response_scale = 1.0
     excess = abs(error_px) - DEAD_ZONE_PX
     taper = 0.5 + 0.5 * min(1.0, excess / 80.0)
-    delta = KP * error_px * taper
+    delta = KP * error_px * taper * response_scale
     if invert_direction:
         delta = -delta
-    delta = max(-MAX_STEP_DEG, min(MAX_STEP_DEG, delta))
-    if abs(delta) < 1.0:
-        delta = 1.0 if delta >= 0.0 else -1.0
+    max_step = MAX_STEP_DEG * response_scale
+    delta = max(-max_step, min(max_step, delta))
 
     updated_angle = current_angle + SMOOTHING * delta
     updated_angle = max(MIN_ANGLE, min(MAX_ANGLE, updated_angle))
-    if round(updated_angle) == round(current_angle):
-        updated_angle = max(
-            MIN_ANGLE,
-            min(MAX_ANGLE, current_angle + (1.0 if delta > 0 else -1.0)),
-        )
     return updated_angle
+
+
+def smooth_face_error(previous_error, measured_error):
+    """Filter detection jitter while retaining gradual face movement."""
+    if previous_error is None:
+        return float(measured_error)
+    return previous_error + ERROR_SMOOTHING * (measured_error - previous_error)
+
+
+def advance_scan(
+    current_angle,
+    direction,
+    completed_cycles,
+    reached_start,
+    elapsed_seconds,
+):
+    remaining = max(0.0, elapsed_seconds) * SCAN_SPEED_DEG_PER_SECOND
+    while remaining > 0 and completed_cycles < SCAN_CYCLES:
+        endpoint = MAX_ANGLE if direction > 0 else MIN_ANGLE
+        distance = abs(endpoint - current_angle)
+        if remaining < distance:
+            current_angle += direction * remaining
+            remaining = 0.0
+            continue
+
+        current_angle = float(endpoint)
+        remaining -= distance
+        if direction < 0:
+            if reached_start:
+                completed_cycles += 1
+            else:
+                reached_start = True
+        direction *= -1
+
+    return current_angle, direction, completed_cycles, reached_start
 
 
 def run_tracker(
@@ -201,14 +296,7 @@ def run_tracker(
             serial_connection.reset_output_buffer()
             send_servo_angle(serial_connection, 90, False)
 
-        cascade_path = os.path.join(
-            cv2.data.haarcascades, "haarcascade_frontalface_default.xml"
-        )
-        face_cascade = cv2.CascadeClassifier(cascade_path)
-        if face_cascade.empty():
-            raise RuntimeError(
-                "Could not load the Haar cascade: {0}".format(cascade_path)
-            )
+        face_cascades = load_face_cascades()
 
         camera = open_camera(camera_index)
         current_angle = 90.0
@@ -218,6 +306,15 @@ def run_tracker(
         consecutive_read_failures = 0
         face_center_x = None
         error_px = None
+        filtered_error_px = None
+        face_velocity_px_per_frame = 0.0
+        last_face_seen_at = time.monotonic()
+        scan_active = False
+        scan_wait_until = None
+        scan_direction = -1
+        scan_completed_cycles = 0
+        scan_reached_start = False
+        last_scan_update = last_face_seen_at
 
         cv2.namedWindow("Face Tracker", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Face Tracker", 640, 480)
@@ -241,25 +338,82 @@ def run_tracker(
             frame_center_x = frame_width // 2
             frame_center_y = frame_height // 2
             frame_count += 1
+            now = time.monotonic()
 
             if (frame_count - 1) % DETECT_EVERY_N_FRAMES == 0:
                 gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 gray_frame = cv2.equalizeHist(gray_frame)
-                last_face = detect_largest_face(gray_frame, face_cascade)
+                last_face = detect_largest_face(gray_frame, face_cascades)
 
             if last_face is not None:
+                last_face_seen_at = now
+                scan_active = False
+                scan_wait_until = None
+                scan_completed_cycles = 0
+                scan_reached_start = False
                 x, y, width, height = (int(value) for value in last_face)
                 face_center_x = x + width // 2
                 face_center_y = y + height // 2
-                error_px = face_center_x - frame_center_x
+                measured_error_px = face_center_x - frame_center_x
+                previous_filtered_error_px = filtered_error_px
+                filtered_error_px = smooth_face_error(
+                    filtered_error_px,
+                    measured_error_px,
+                )
+                if previous_filtered_error_px is not None:
+                    measured_velocity = (
+                        filtered_error_px - previous_filtered_error_px
+                    )
+                    face_velocity_px_per_frame += VELOCITY_SMOOTHING * (
+                        measured_velocity - face_velocity_px_per_frame
+                    )
+                else:
+                    face_velocity_px_per_frame = 0.0
+                error_px = filtered_error_px
                 current_angle = update_pan_angle(
                     current_angle,
-                    error_px,
+                    filtered_error_px,
                     invert_direction,
+                    face_velocity_px_per_frame,
                 )
             else:
                 face_center_x = None
                 error_px = None
+                filtered_error_px = None
+                face_velocity_px_per_frame = 0.0
+                if USE_SERVO:
+                    if scan_active:
+                        elapsed = min(max(0.0, now - last_scan_update), 0.1)
+                        last_scan_update = now
+                        (
+                            current_angle,
+                            scan_direction,
+                            scan_completed_cycles,
+                            scan_reached_start,
+                        ) = advance_scan(
+                            current_angle,
+                            scan_direction,
+                            scan_completed_cycles,
+                            scan_reached_start,
+                            elapsed,
+                        )
+                        if scan_completed_cycles >= SCAN_CYCLES:
+                            scan_active = False
+                            scan_wait_until = now + SCAN_RETRY_DELAY_SECONDS
+                    elif scan_wait_until is not None:
+                        if now >= scan_wait_until:
+                            scan_wait_until = None
+                            scan_active = True
+                            scan_direction = -1
+                            scan_completed_cycles = 0
+                            scan_reached_start = False
+                            last_scan_update = now
+                    elif now - last_face_seen_at >= NO_FACE_SCAN_DELAY_SECONDS:
+                        scan_active = True
+                        scan_direction = -1
+                        scan_completed_cycles = 0
+                        scan_reached_start = False
+                        last_scan_update = now
 
             if USE_SERVO:
                 crop_x, crop_y, crop_w, crop_h = crop_origin(
@@ -349,9 +503,24 @@ def run_tracker(
                 (0, 255, 255),
                 2,
             )
+            if last_face is not None:
+                tracking_status = "TRACKING"
+            elif scan_active:
+                tracking_status = "SCANNING {0}/{1}".format(
+                    scan_completed_cycles + 1,
+                    SCAN_CYCLES,
+                )
+            elif scan_wait_until is not None:
+                tracking_status = "RESCAN IN {0}s".format(
+                    max(0, math.ceil(scan_wait_until - time.monotonic()))
+                )
+            else:
+                no_face_seconds = int(time.monotonic() - last_face_seen_at)
+                tracking_status = "NO FACE ({0}s)".format(no_face_seconds)
+
             cv2.putText(
                 preview,
-                "TRACKING" if last_face is not None else "NO FACE",
+                tracking_status,
                 (10, 55),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
