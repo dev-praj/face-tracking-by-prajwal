@@ -11,9 +11,9 @@ not compatible with the current tracker.
 
 ## How tracking works
 
-1. OpenCV reads frames from the selected webcam and checks frontal and
-   profile-face cascades, including a mirrored profile pass for either
-   direction of head turn.
+1. OpenCV rejects very dark or low-contrast frames, then checks frontal and
+   profile-face cascades, including a mirrored profile pass and rotated frontal
+   searches for slight head tilts.
 2. The largest detected face is treated as the subject.
 3. The tracker compares the face's horizontal center with the frame center.
 4. It converts the horizontal error into a bounded pan angle and sends that
@@ -22,11 +22,14 @@ not compatible with the current tracker.
 
 When the face is near the center, the servo holds its position. The tracker
 shows `TRACKING` or `NO FACE`, the horizontal pixel offset, the commanded angle,
-and the active pan direction in its preview. Face-position filtering helps
-reduce jitter. The pan response adds a limited boost when the face moves away
-from center and slows as it moves back toward center, helping avoid overshoot.
-The servo step remains bounded and the angle is limited to its configured
-range.
+and the active pan direction in its preview. Detections require stronger
+cascade agreement and confirmation across consecutive frames to reduce false
+positives. A face candidate must also contain a plausible eye pair (or one
+visible eye for a profile face) before it can control the servo. Face-position
+filtering helps reduce jitter. The pan response adds a limited boost when the
+face moves away from center and slows as it moves back toward center, helping
+avoid overshoot. The servo step remains bounded and the angle is limited to its
+configured range.
 
 If no face is detected for 10 seconds, the tracker scans between the configured
 pan limits with two complete back-and-forth sweeps. It checks every camera frame
